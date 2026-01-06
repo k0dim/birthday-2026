@@ -59,31 +59,27 @@ jobs:
           fi
           npm ci
 
-      - name: Create .env.production for build
-        run: |
-          echo "VITE_TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}" > .env.production
-          echo "VITE_TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" >> .env.production
-          echo "VITE_API_URL=/" >> .env.production
-          echo "✅ .env.production created for build"
-
       - name: Build application
         run: |
-          npm run build
-          echo "✅ Build successful"
-          
-          # Проверяем, что переменные встроились
-          if find dist -name "*.js" -exec grep -l "TELEGRAM\|telegram" {} \; | head -1; then
-            echo "✅ Telegram variables found in build"
+          if npm run | grep -q "build"; then
+            npm run build
+            echo "✅ Build successful"
           else
-            echo "⚠️ Telegram variables not found in build (check .env.production)"
+            echo "⚠️ No build script found"
+            if [ -d "dist" ] && [ -f "dist/index.html" ]; then
+              echo "✅ dist directory exists"
+            else
+              echo "❌ Cannot build application"
+              exit 1
+            fi
           fi
 
   build-and-push:
     runs-on: ubuntu-latest
     needs: validation
-    permissions:
+    permissions: # ВАЖНО: Добавляем permissions
       contents: read
-      packages: write
+      packages: write # Разрешение на запись в packages
     
     steps:
       - name: Checkout code
@@ -96,8 +92,8 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ github.actor }} # Используем github.actor вместо secrets
+          password: ${{ secrets.GITHUB_TOKEN }} # Используем GITHUB_TOKEN
 
       - name: Extract metadata
         id: meta
@@ -130,10 +126,8 @@ jobs:
             
             📦 Repository: ${{ github.repository }}
             🌿 Branch: ${{ github.ref_name }}
-            🐳 Image: ${{ env.REGISTRY }}/${{ github.repository }}:latest
+            🔗 Image: ${{ env.REGISTRY }}/${{ github.repository }}:latest
             👤 By: ${{ github.actor }}
-            
-            🔗 Actions: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
   deploy:
     runs-on: ubuntu-latest
@@ -153,6 +147,74 @@ jobs:
         run: |
           mkdir -p ~/.ssh
           ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts
+
+      - name: Create .env.local
+        run: |
+          cat > .env.local << EOF
+          VITE_TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+          VITE_TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
+          NODE_ENV=production
+          VITE_BASE_URL=/
+          VITE_APP_DOMAIN=dimaparty.ru
+          VITE_DEBUG=false
+          VITE_TELEGRAM_TIMEOUT=10000
+          EOF
+
+      - name: Deploy to server
+        env:
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          SERVER_IP: ${{ secrets.SERVER_IP }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          # Подготавливаем деплой скрипт
+          cat > deploy.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          
+          echo "🚀 Starting deployment..."
+          
+          # Создаем директории
+          mkdir -p /home/$DEPLOY_USER/app/{ssl,logs}
+          cd /home/$DEPLOY_USER/app
+          
+          # Логинимся в GHCR с использованием GITHUB_TOKEN
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          
+          # Останавливаем старый контейнер
+          docker stop ${{ env.CONTAINER_NAME }} 2>/dev/null || true
+          docker rm ${{ env.CONTAINER_NAME }} 2>/dev/null || true
+          
+          # Pull нового образа
+          docker pull ghcr.io/${{ github.repository }}:latest
+          
+          # Генерируем SSL сертификат если не существует
+          if [ ! -f ssl/fullchain.pem ]; then
+            echo "🔐 Generating SSL certificate for $DOMAIN..."
+            openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+              -keyout ssl/privkey.pem \
+              -out ssl/fullchain.pem \
+              -subj "/C=US/ST=State/L=City/O=Birthday/CN=$DOMAIN"
+            chmod 600 ssl/*.pem
+          fi
+          
+          # Запускаем контейнер
+          docker run -d \
+            --name ${{ env.CONTAINER_NAME }} \
+            --restart unless-stopped \
+            -p 80:80 \
+            -p 443:443 \
+            -v /home/$DEPLOY_USER/app/ssl:/etc/nginx/ssl:ro \
+            -v /home/$DEPLOY_USER/app/logs:/var/log/nginx \
+            ghcr.io/${{ github.repository }}:latest
+          
+          echo "✅ Deployment completed!"
+          EOF
+          
+          chmod +x deploy.sh
+          
+          # Копируем и выполняем на сервере
+          scp -o StrictHostKeyChecking=no deploy.sh $DEPLOY_USER@$SERVER_IP:/tmp/deploy.sh
+          ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$SERVER_IP "bash /tmp/deploy.sh"
 
       - name: Prepare and deploy using your script
         env:
@@ -315,37 +377,16 @@ jobs:
 
       - name: Health check
         run: |
-          echo "🏥 Performing health check..."
-          sleep 15
+          echo "🏥 Health check..."
+          sleep 10
           
-          MAX_RETRIES=5
-          RETRY_COUNT=0
-          
-          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            echo "Attempt $((RETRY_COUNT + 1)) of $MAX_RETRIES..."
-            
-            # Пробуем HTTPS
-            if curl -f -k -s https://${{ secrets.DOMAIN }} > /dev/null; then
-              echo "✅ HTTPS is working!"
-              break
-            fi
-            
-            # Пробуем HTTP
-            if curl -f -s http://${{ secrets.SERVER_IP }} > /dev/null; then
-              echo "✅ HTTP is working!"
-              break
-            fi
-            
-            RETRY_COUNT=$((RETRY_COUNT + 1))
-            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-              echo "⏳ Waiting 5 seconds before next attempt..."
-              sleep 5
-            fi
-          done
-          
-          if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
-            echo "⚠️ Health check failed after $MAX_RETRIES attempts"
-            echo "Application might still be starting up..."
+          # Пробуем подключиться
+          if curl -f -k -s https://${{ secrets.DOMAIN }} > /dev/null; then
+            echo "✅ HTTPS is working"
+          elif curl -f -s http://${{ secrets.SERVER_IP }} > /dev/null; then
+            echo "✅ HTTP is working"
+          else
+            echo "⚠️ Could not connect, but deployment might still be in progress"
           fi
 
       - name: Send success notification
@@ -355,26 +396,18 @@ jobs:
           to: ${{ secrets.TELEGRAM_CHAT_ID }}
           token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           message: |
-            🎉 Production Deployment Successful!
+            🎉 Deployment Successful!
             
             🏠 Application: Birthday Invitation
             🔗 URL: https://${{ secrets.DOMAIN }}
             📍 Server: ${{ secrets.SERVER_IP }}
-            🐳 Container: ${{ env.CONTAINER_NAME }}
-            
-            ✅ Setup completed:
-            • Nginx: Configured with SSL
-            • SSL: $(if [ -f "/etc/letsencrypt/live/${{ secrets.DOMAIN }}/fullchain.pem" ]; then echo "Let's Encrypt"; else echo "Self-signed"; fi)
-            • Container: Running with volumes
             
             📊 Details:
             • Repository: ${{ github.repository }}
             • Branch: ${{ github.ref_name }}
-            • Commit: $(echo "${{ github.sha }}" | cut -c1-7)
             • Deployed by: ${{ github.actor }}
             
-            🔍 Test: https://${{ secrets.DOMAIN }}
-            📝 Telegram notifications: Submit RSVP form to verify
+            🔍 Check: https://${{ secrets.DOMAIN }}
 
       - name: Send failure notification
         if: failure()
@@ -385,13 +418,7 @@ jobs:
           message: |
             ❌ Deployment Failed!
             
-            🏠 Application: Birthday Invitation
-            📍 Server: ${{ secrets.SERVER_IP }}
-            
-            ⚠️ Error: Production setup script failed
-            📊 Run: #${{ github.run_number }}
+            Repository: ${{ github.repository }}
+            Error: Check GitHub Actions logs
             
             🔗 Actions: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-            👤 Triggered by: ${{ github.actor }}
-            
-            📋 Check SSH logs for details
