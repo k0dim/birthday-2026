@@ -292,26 +292,45 @@ jobs:
           echo "Domain: ${{ secrets.DOMAIN }}"
 
       - name: Deploy to server
-        env:
-          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-          SERVER_IP: ${{ secrets.SERVER_IP }}
-          DOMAIN: ${{ secrets.DOMAIN }}
-          REGISTRY: ${{ env.REGISTRY }}
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
-          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
         run: |
-          # Создаем скрипт деплоя
+          echo "=== Starting deployment ==="
+          
+          # Проверяем переменные перед использованием
+          echo "Checking variables:"
+          echo "DEPLOY_USER: ${{ secrets.DEPLOY_USER }}"
+          echo "SERVER_IP: ${{ secrets.SERVER_IP }}"
+          echo "DOMAIN: ${{ secrets.DOMAIN }}"
+          echo "IMAGE_NAME: ${{ github.repository }}"
+          
+          # Проверяем что переменные не пустые
+          if [ -z "${{ secrets.DOMAIN }}" ]; then
+            echo "❌ DOMAIN is empty!"
+            exit 1
+          fi
+          
+          if [ -z "${{ github.repository }}" ]; then
+            echo "❌ Repository name is empty!"
+            exit 1
+          fi
+          
+          # Создаем скрипт деплоя с подстановкой переменных GitHub Actions
           cat > deploy.sh << 'DEPLOY_EOF'
           #!/bin/bash
           set -e
           
           echo "🚀 Starting deployment to $(hostname)..."
-          echo "Domain: $DOMAIN"
-          echo "Image: $REGISTRY/$IMAGE_NAME:latest"
+          echo "Domain: $1"
+          echo "Image: ghcr.io/$2:latest"
+          
+          DOMAIN="$1"
+          IMAGE_NAME="$2"
+          GITHUB_ACTOR="$3"
+          GITHUB_TOKEN="$4"
+          CONTAINER_NAME="birthday-app"
           
           # Создаем директории
-          mkdir -p /home/$DEPLOY_USER/app/{ssl,config,logs}
-          cd /home/$DEPLOY_USER/app
+          mkdir -p /home/$USER/app/{ssl,config,logs}
+          cd /home/$USER/app
           
           # Генерируем SSL если нужно
           if [ ! -f ssl/fullchain.pem ]; then
@@ -327,7 +346,7 @@ jobs:
           fi
           
           # Создаем nginx конфиг
-          cat > config/nginx.conf << 'NGINX_EOF'
+          cat > config/nginx.conf << NGINX_EOF
           events {
               worker_connections 1024;
           }
@@ -374,11 +393,11 @@ jobs:
           
           # Логинимся в GHCR
           echo "🔐 Logging into GHCR..."
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           
           # Pull нового образа
           echo "📥 Pulling new image..."
-          docker pull $REGISTRY/$IMAGE_NAME:latest
+          docker pull "ghcr.io/$IMAGE_NAME:latest"
           
           # Запускаем контейнер
           echo "🐳 Starting new container..."
@@ -390,7 +409,7 @@ jobs:
             -v $(pwd)/config/nginx.conf:/etc/nginx/nginx.conf:ro \
             -v $(pwd)/ssl:/etc/nginx/ssl:ro \
             -v $(pwd)/logs:/var/log/nginx \
-            $REGISTRY/$IMAGE_NAME:latest
+            "ghcr.io/$IMAGE_NAME:latest"
           
           echo "✅ Container started successfully"
           
@@ -406,7 +425,7 @@ jobs:
           
           # Проверка HTTP редиректа
           echo "Testing HTTP -> HTTPS redirect..."
-          HTTP_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://$DOMAIN || echo "000")
+          HTTP_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" "http://$DOMAIN" || echo "000")
           if [ "$HTTP_RESPONSE" = "301" ] || [ "$HTTP_RESPONSE" = "302" ]; then
             echo "✅ HTTP redirect working ($HTTP_RESPONSE)"
           else
@@ -415,13 +434,13 @@ jobs:
           
           # Проверка HTTPS
           echo "Testing HTTPS..."
-          HTTPS_RESPONSE=$(curl -k -s -o /dev/null -w "%{http_code}" https://$DOMAIN || echo "000")
+          HTTPS_RESPONSE=$(curl -k -s -o /dev/null -w "%{http_code}" "https://$DOMAIN" || echo "000")
           if [ "$HTTPS_RESPONSE" = "200" ]; then
             echo "✅ HTTPS working (200 OK)"
             
             # Дополнительная проверка контента
             echo "Checking site content..."
-            if curl -k -s https://$DOMAIN | grep -q "DOCTYPE\|html"; then
+            if curl -k -s "https://$DOMAIN" | grep -q "DOCTYPE\|html"; then
               echo "✅ HTML content served"
             fi
           else
@@ -433,14 +452,17 @@ jobs:
           echo "🎉 Deployment completed!"
           DEPLOY_EOF
           
-          # Делаем скрипт исполняемым и копируем на сервер
+          # Делаем скрипт исполняемым
           chmod +x deploy.sh
-          echo "📤 Copying deployment script to server..."
-          scp -o StrictHostKeyChecking=no deploy.sh $DEPLOY_USER@$SERVER_IP:/tmp/deploy.sh
           
-          # Выполняем на сервере
-          echo "🚀 Executing deployment script on server..."
-          ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$SERVER_IP "bash /tmp/deploy.sh"
+          echo "📤 Copying deployment script to server..."
+          # Копируем скрипт на сервер
+          scp -o StrictHostKeyChecking=no deploy.sh ${{ secrets.DEPLOY_USER }}@${{ secrets.SERVER_IP }}:/tmp/deploy.sh
+          
+          # Выполняем на сервере с передачей аргументов
+          echo "🚀 Executing deployment script on server with arguments..."
+          ssh -o StrictHostKeyChecking=no ${{ secrets.DEPLOY_USER }}@${{ secrets.SERVER_IP }} \
+            "bash /tmp/deploy.sh '${{ secrets.DOMAIN }}' '${{ github.repository }}' '${{ github.actor }}' '${{ secrets.GITHUB_TOKEN }}'"
 
       - name: Verify deployment
         run: |
