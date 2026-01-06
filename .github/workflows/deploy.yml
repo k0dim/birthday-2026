@@ -170,71 +170,41 @@ jobs:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           SERVER_IP: ${{ secrets.SERVER_IP }}
           DOMAIN: ${{ secrets.DOMAIN }}
-          REGISTRY: ${{ env.REGISTRY }}
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
         run: |
-          # Create deployment script
-          cat > deploy.sh << 'DEPLOY_EOF'
-          #!/bin/bash
-          set -e
+          # Подготовка конфигурации на сервере
+          ssh $DEPLOY_USER@$SERVER_IP << 'EOF'
+          mkdir -p ~/app
+          cd ~/app
           
-          echo "🚀 Starting deployment..."
+          # Создаем nginx конфиг на сервере
+          cat > nginx-birthday.conf << 'NGINX_EOF'
+          server {
+              listen 80;
+              server_name $DOMAIN;
+              
+              location / {
+                  proxy_pass http://localhost:3000;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade \$http_upgrade;
+                  proxy_set_header Connection 'upgrade';
+                  proxy_set_header Host \$host;
+                  proxy_cache_bypass \$http_upgrade;
+              }
+          }
+          NGINX_EOF
           
-          # Create app directory
-          mkdir -p /home/$DEPLOY_USER/app/{ssl,logs}
-          cd /home/$DEPLOY_USER/app
+          # Останавливаем старый контейнер
+          docker stop birthday-app 2>/dev/null || true
+          docker rm birthday-app 2>/dev/null || true
           
-          # Login to GHCR
-          echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
-          
-          # Stop and remove old container
-          docker stop $CONTAINER_NAME 2>/dev/null || true
-          docker rm $CONTAINER_NAME 2>/dev/null || true
-          
-          # Remove old image
-          docker rmi $REGISTRY/$IMAGE_NAME:latest 2>/dev/null || true
-          
-          # Pull new image
-          echo "📥 Pulling new image..."
-          docker pull $REGISTRY/$IMAGE_NAME:latest
-          
-          # Generate SSL certificate if not exists
-          if [ ! -f ssl/fullchain.pem ]; then
-            echo "🔐 Generating SSL certificate..."
-            openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-              -keyout ssl/privkey.pem \
-              -out ssl/fullchain.pem \
-              -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN"
-            chmod 600 ssl/*
-          fi
-          
-          # Run container
-          echo "🐳 Starting container..."
+          # Запускаем новый
           docker run -d \
-            --name $CONTAINER_NAME \
+            --name birthday-app \
             --restart unless-stopped \
-            -p 80:80 \
-            -p 443:443 \
-            -v /home/$DEPLOY_USER/app/ssl:/etc/nginx/ssl:ro \
-            -v /home/$DEPLOY_USER/app/logs:/var/log/nginx \
-            $REGISTRY/$IMAGE_NAME:latest
-          
-          echo "✅ Container started!"
-          
-          # Show container info
-          echo "📊 Container status:"
-          docker ps --filter "name=$CONTAINER_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-          
-          echo "📋 Recent logs:"
-          docker logs --tail 5 $CONTAINER_NAME
-          DEPLOY_EOF
-          
-          # Make script executable and copy to server
-          chmod +x deploy.sh
-          scp -o StrictHostKeyChecking=no deploy.sh $DEPLOY_USER@$SERVER_IP:/tmp/deploy.sh
-          
-          # Execute on server
-          ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$SERVER_IP "bash /tmp/deploy.sh"
+            -p 3000:80 \
+            -v /home/$DEPLOY_USER/app/nginx-birthday.conf:/etc/nginx/conf.d/default.conf \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          EOF
 
       - name: Health check
         run: |
