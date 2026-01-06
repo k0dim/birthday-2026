@@ -160,49 +160,95 @@ jobs:
           VITE_TELEGRAM_TIMEOUT=10000
           EOF
 
-      - name: Deploy with full SSL and nginx configuration
+      - name: Deploy to server
         env:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           SERVER_IP: ${{ secrets.SERVER_IP }}
           DOMAIN: ${{ secrets.DOMAIN }}
         run: |
-          echo "=== Deploying with full SSL and Nginx configuration ==="
-          
-          # Создаем полный скрипт деплоя
-          cat > full-deploy.sh << 'FULL_DEPLOY_EOF'
+          # Подготавливаем деплой скрипт
+          cat > deploy.sh << 'EOF'
           #!/bin/bash
           set -e
           
-          echo "🚀 Starting production deployment..."
+          echo "🚀 Starting deployment..."
           
-          # Определяем пользователя и рабочую директорию
-          DEPLOY_USER="$1"
-          DOMAIN="$2"
-          GITHUB_REPO="$3"
-          GITHUB_ACTOR="$4"
-          GITHUB_TOKEN="$5"
+          # Создаем директории
+          mkdir -p /home/$DEPLOY_USER/app/{ssl,logs}
+          cd /home/$DEPLOY_USER/app
           
-          echo "Deploying as user: $DEPLOY_USER"
-          echo "Domain: $DOMAIN"
-          echo "Repository: $GITHUB_REPO"
+          # Логинимся в GHCR с использованием GITHUB_TOKEN
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           
-          # Определяем домашнюю директорию
-          if [ "$DEPLOY_USER" = "root" ]; then
-              HOME_DIR="/root"
-          else
-              HOME_DIR="/home/$DEPLOY_USER"
+          # Останавливаем старый контейнер
+          docker stop ${{ env.CONTAINER_NAME }} 2>/dev/null || true
+          docker rm ${{ env.CONTAINER_NAME }} 2>/dev/null || true
+          
+          # Pull нового образа
+          docker pull ghcr.io/${{ github.repository }}:latest
+          
+          # Генерируем SSL сертификат если не существует
+          if [ ! -f ssl/fullchain.pem ]; then
+            echo "🔐 Generating SSL certificate for $DOMAIN..."
+            openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+              -keyout ssl/privkey.pem \
+              -out ssl/fullchain.pem \
+              -subj "/C=US/ST=State/L=City/O=Birthday/CN=$DOMAIN"
+            chmod 600 ssl/*.pem
           fi
           
-          APP_DIR="$HOME_DIR/app"
-          echo "App directory: $APP_DIR"
+          # Запускаем контейнер
+          docker run -d \
+            --name ${{ env.CONTAINER_NAME }} \
+            --restart unless-stopped \
+            -p 80:80 \
+            -p 443:443 \
+            -v /home/$DEPLOY_USER/app/ssl:/etc/nginx/ssl:ro \
+            -v /home/$DEPLOY_USER/app/logs:/var/log/nginx \
+            ghcr.io/${{ github.repository }}:latest
           
-          # Создаем рабочие директории
-          mkdir -p "$APP_DIR"/{ssl,config,logs}
-          cd "$APP_DIR"
+          echo "✅ Deployment completed!"
+          EOF
           
-          # 1. Создаем nginx.conf с SSL
-          echo "1. Creating nginx configuration with SSL..."
-          cat > config/nginx.conf << 'NGINX_CONF_EOF'
+          chmod +x deploy.sh
+          
+          # Копируем и выполняем на сервере
+          scp -o StrictHostKeyChecking=no deploy.sh $DEPLOY_USER@$SERVER_IP:/tmp/deploy.sh
+          ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$SERVER_IP "bash /tmp/deploy.sh"
+
+      - name: Prepare and deploy using your script
+        env:
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          SERVER_IP: ${{ secrets.SERVER_IP }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          echo "=== Deploying with production setup script ==="
+          
+          # Создаем ваш скрипт setup-production.sh
+          cat > setup-production.sh << 'SCRIPT_EOF'
+          #!/bin/bash
+          set -e
+          
+          echo "=== Production Setup ==="
+          
+          # Определяем пользователя
+          USER=$(whoami)
+          echo "Running as user: \$USER"
+          
+          # Создаем рабочую директорию
+          if [ "\$USER" = "root" ]; then
+              APP_DIR="/root/app"
+          else
+              APP_DIR="/home/\$USER/app"
+          fi
+          
+          mkdir -p \$APP_DIR
+          cd \$APP_DIR
+          echo "Working directory: \$(pwd)"
+          
+          # 1. Создаем nginx.conf
+          echo "1. Creating nginx.conf..."
+          cat > nginx.conf << 'NGINXEOF'
           events {
               worker_connections 1024;
           }
@@ -228,12 +274,6 @@ jobs:
                   ssl_protocols TLSv1.2 TLSv1.3;
                   ssl_ciphers HIGH:!aNULL:!MD5;
                   
-                  # Security headers
-                  add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-                  add_header X-Frame-Options "SAMEORIGIN" always;
-                  add_header X-Content-Type-Options "nosniff" always;
-                  add_header X-XSS-Protection "1; mode=block" always;
-                  
                   root /usr/share/nginx/html;
                   
                   location / {
@@ -244,41 +284,29 @@ jobs:
                       expires 1y;
                       add_header Cache-Control "public, immutable";
                   }
-                  
-                  # Security: deny access to hidden files
-                  location ~ /\. {
-                      deny all;
-                  }
               }
           }
-          NGINX_CONF_EOF
+          NGINXEOF
           
-          # Заменяем переменную DOMAIN в конфиге
-          sed -i "s/\$DOMAIN/$DOMAIN/g" config/nginx.conf
-          echo "✅ Nginx configuration created"
-          
-          # 2. Настраиваем SSL сертификаты
+          # 2. Создаем/проверяем SSL сертификаты
           echo "2. Setting up SSL certificates..."
+          mkdir -p ssl
           
           # Проверяем Let's Encrypt
-          if [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
+          if [ -f /etc/letsencrypt/live/$DOMAIN/fullchain.pem ]; then
               echo "✅ Using Let's Encrypt certificates"
               SSL_SOURCE="letsencrypt"
           else
               echo "⚠️ Using self-signed certificates"
               SSL_SOURCE="selfsigned"
               
-              # Генерируем self-signed сертификат
-              if [ ! -f "ssl/fullchain.pem" ]; then
-                  echo "Generating self-signed SSL certificate for $DOMAIN..."
+              # Генерируем self-signed
+              if [ ! -f ssl/fullchain.pem ]; then
                   openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
                     -keyout ssl/privkey.pem \
                     -out ssl/fullchain.pem \
                     -subj "/C=RU/ST=Moscow/L=Moscow/O=Birthday/CN=$DOMAIN"
                   chmod 600 ssl/*
-                  echo "✅ Self-signed SSL certificate generated"
-              else
-                  echo "✅ Self-signed SSL certificate already exists"
               fi
           fi
           
@@ -289,96 +317,63 @@ jobs:
           
           # 4. Логинимся в GHCR
           echo "4. Logging into GHCR..."
-          echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           
           # 5. Pull нового образа
           echo "5. Pulling new image..."
-          docker pull "ghcr.io/$GITHUB_REPO:latest"
+          docker pull ghcr.io/${{ github.repository }}:latest
           
-          # 6. Запускаем контейнер с правильной конфигурацией
-          echo "6. Starting container with SSL configuration..."
+          # 6. Запускаем новый контейнер
+          echo "6. Starting new container..."
           
-          if [ "$SSL_SOURCE" = "letsencrypt" ]; then
-              # С Let's Encrypt сертификатами
-              docker run -d \
-                --name birthday-app \
-                --restart unless-stopped \
-                -p 80:80 \
-                -p 443:443 \
-                -v "$APP_DIR/config/nginx.conf:/etc/nginx/nginx.conf:ro" \
-                -v "/etc/letsencrypt/live/$DOMAIN/fullchain.pem:/etc/nginx/ssl/fullchain.pem:ro" \
-                -v "/etc/letsencrypt/live/$DOMAIN/privkey.pem:/etc/nginx/ssl/privkey.pem:ro" \
-                -v "$APP_DIR/logs:/var/log/nginx" \
-                "ghcr.io/$GITHUB_REPO:latest"
+          if [ "\$SSL_SOURCE" = "letsencrypt" ]; then
+              # С Let's Encrypt
+              docker run -d \\
+                --name birthday-app \\
+                --restart unless-stopped \\
+                -p 80:80 \\
+                -p 443:443 \\
+                -v \$APP_DIR/nginx.conf:/etc/nginx/nginx.conf:ro \\
+                -v /etc/letsencrypt/live/$DOMAIN/fullchain.pem:/etc/nginx/ssl/fullchain.pem:ro \\
+                -v /etc/letsencrypt/live/$DOMAIN/privkey.pem:/etc/nginx/ssl/privkey.pem:ro \\
+                ghcr.io/${{ github.repository }}:latest
           else
-              # С self-signed сертификатами
-              docker run -d \
-                --name birthday-app \
-                --restart unless-stopped \
-                -p 80:80 \
-                -p 443:443 \
-                -v "$APP_DIR/config/nginx.conf:/etc/nginx/nginx.conf:ro" \
-                -v "$APP_DIR/ssl:/etc/nginx/ssl:ro" \
-                -v "$APP_DIR/logs:/var/log/nginx" \
-                "ghcr.io/$GITHUB_REPO:latest"
+              # С self-signed
+              docker run -d \\
+                --name birthday-app \\
+                --restart unless-stopped \\
+                -p 80:80 \\
+                -p 443:443 \\
+                -v \$APP_DIR/nginx.conf:/etc/nginx/nginx.conf:ro \\
+                -v \$APP_DIR/ssl:/etc/nginx/ssl:ro \\
+                ghcr.io/${{ github.repository }}:latest
           fi
           
-          echo "✅ Container started"
-          
-          # 7. Проверяем деплой
+          # 7. Проверяем
           echo "7. Testing deployment..."
-          sleep 8
+          sleep 5
           
           echo "Container status:"
           docker ps --filter "name=birthday-app" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
           
-          echo -e "\nTesting HTTP (should redirect to HTTPS):"
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://$DOMAIN" || echo "000")
-          echo "HTTP response: $HTTP_CODE"
-          
           echo -e "\nTesting HTTPS:"
-          HTTPS_CODE=$(curl -k -s -o /dev/null -w "%{http_code}" "https://$DOMAIN" || echo "000")
-          echo "HTTPS response: $HTTPS_CODE"
+          curl -k -s -o /dev/null -w "HTTPS Status: %{http_code}\\n" https://$DOMAIN
           
-          if [ "$HTTPS_CODE" = "200" ]; then
-              echo "✅ HTTPS is working correctly (200 OK)"
-              
-              # Дополнительная проверка контента
-              echo "Checking site content..."
-              if curl -k -s "https://$DOMAIN" | grep -q "DOCTYPE\|html"; then
-                  echo "✅ HTML content served correctly"
-              fi
-              
-              # Проверяем favicon
-              if curl -k -s "https://$DOMAIN" | grep -q "favicon"; then
-                  echo "✅ Favicon references found"
-              fi
-          else
-              echo "⚠️ HTTPS check failed, checking logs..."
-              docker logs birthday-app --tail 20
+          echo -e "\n✅ Setup completed!"
+          echo "🔗 Access: https://$DOMAIN"
+          if [ "\$SSL_SOURCE" = "selfsigned" ]; then
+              echo "⚠️ Using self-signed certificate (browser will show warning)"
           fi
-          
-          echo -e "\n🎉 Production deployment completed successfully!"
-          echo "🔗 Access your site: https://$DOMAIN"
-          if [ "$SSL_SOURCE" = "selfsigned" ]; then
-              echo "⚠️ Note: Using self-signed certificate (browser will show warning)"
-          fi
-          FULL_DEPLOY_EOF
+          SCRIPT_EOF
           
           # Делаем скрипт исполняемым
-          chmod +x full-deploy.sh
+          chmod +x setup-production.sh
           
-          echo "📤 Copying deployment script to server..."
-          scp -o StrictHostKeyChecking=no full-deploy.sh "$DEPLOY_USER@$SERVER_IP:/tmp/full-deploy.sh"
+          echo "📤 Copying setup script to server..."
+          scp -o StrictHostKeyChecking=no setup-production.sh $DEPLOY_USER@$SERVER_IP:/tmp/setup-production.sh
           
-          echo "🚀 Executing deployment script with parameters..."
-          ssh -o StrictHostKeyChecking=no "$DEPLOY_USER@$SERVER_IP" \
-            "bash /tmp/full-deploy.sh \
-            '$DEPLOY_USER' \
-            '$DOMAIN' \
-            '${{ github.repository }}' \
-            '${{ github.actor }}' \
-            '${{ secrets.GITHUB_TOKEN }}'"
+          echo "🚀 Executing setup script on server..."
+          ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$SERVER_IP "bash /tmp/setup-production.sh"
 
       - name: Health check
         run: |
