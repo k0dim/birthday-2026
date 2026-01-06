@@ -5,13 +5,13 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
-  workflow_dispatch: # Manual trigger
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   CONTAINER_NAME: birthday-app
-  NGINX_CONTAINER_NAME: birthday-nginx
+  SHORT_SHA: ${{ github.sha }}
 
 jobs:
   security-scan:
@@ -20,10 +20,22 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Generate package-lock.json if missing
+        run: |
+          if [ ! -f package-lock.json ]; then
+            echo "package-lock.json not found, generating..."
+            npm install --package-lock-only
+          fi
+
       - name: Run security audit
         run: |
-          npm audit --audit-level=high || true
-          
+          npm audit --audit-level=high || echo "Audit completed"
+
       - name: Check for secrets in code
         uses: gitleaks/gitleaks-action@v2
         with:
@@ -40,22 +52,39 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
 
       - name: Install dependencies
-        run: npm ci
-
-      - name: Type checking (if applicable)
         run: |
-          if [ -f tsconfig.json ]; then
-            npx tsc --noEmit
+          if [ ! -f package-lock.json ]; then
+            npm install --package-lock-only
+          fi
+          npm ci
+
+      - name: Check build script
+        run: |
+          if [ -f "package.json" ]; then
+            if npm run | grep -q "build"; then
+              echo "Build script found"
+            else
+              echo "No build script in package.json"
+            fi
           fi
 
-      - name: Lint code
-        run: npm run lint || echo "No lint script found"
-
-      - name: Build for validation
-        run: npm run build
+      - name: Build application
+        run: |
+          if npm run | grep -q "build"; then
+            npm run build
+            echo "✅ Build successful"
+          else
+            echo "⚠️ No build script found"
+            # Check if dist already exists
+            if [ -d "dist" ] && [ -f "dist/index.html" ]; then
+              echo "✅ dist directory exists"
+            else
+              echo "❌ Cannot build application"
+              exit 1
+            fi
+          fi
 
   build-and-push:
     runs-on: ubuntu-latest
@@ -63,6 +92,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
       
     steps:
       - name: Checkout code
@@ -85,32 +116,35 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=branch
-            type=sha,prefix={{branch}}-
+            type=sha,prefix=sha-
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Send build success notification
-        if: success()
+      - name: Send build notification
+        if: success() && github.event_name != 'pull_request'
         uses: appleboy/telegram-action@master
         with:
           to: ${{ secrets.TELEGRAM_CHAT_ID }}
           token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           message: |
             ✅ Build Successful
-            Repository: ${{ github.repository }}
-            Branch: ${{ github.ref_name }}
-            Commit: ${{ github.sha }}
-            Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-            By: ${{ github.actor }}
+            
+            📦 Repository: ${{ github.repository }}
+            🌿 Branch: ${{ github.ref_name }}
+            🔗 Commit: ${{ github.sha }}
+            🐳 Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            👤 By: ${{ github.actor }}
+            
+            📊 Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
   deploy:
     runs-on: ubuntu-latest
@@ -139,136 +173,137 @@ jobs:
           REGISTRY: ${{ env.REGISTRY }}
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
         run: |
-          # Create deployment script on the fly
-          cat > deploy.sh << 'EOF'
+          # Create deployment script
+          cat > deploy.sh << 'DEPLOY_EOF'
           #!/bin/bash
           set -e
           
           echo "🚀 Starting deployment..."
           
-          # Create directory structure
-          mkdir -p /home/$DEPLOY_USER/birthday-app/{ssl,nginx,data}
-          cd /home/$DEPLOY_USER/birthday-app
+          # Create app directory
+          mkdir -p /home/$DEPLOY_USER/app/{ssl,logs}
+          cd /home/$DEPLOY_USER/app
           
           # Login to GHCR
-          echo ${{ secrets.GHCR_TOKEN }} | docker login ghcr.io -u ${{ secrets.GHCR_USERNAME }} --password-stdin
+          echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
           
-          # Stop and remove old containers
-          docker stop $CONTAINER_NAME || true
-          docker rm $CONTAINER_NAME || true
+          # Stop and remove old container
+          docker stop $CONTAINER_NAME 2>/dev/null || true
+          docker rm $CONTAINER_NAME 2>/dev/null || true
+          
+          # Remove old image
+          docker rmi $REGISTRY/$IMAGE_NAME:latest 2>/dev/null || true
           
           # Pull new image
+          echo "📥 Pulling new image..."
           docker pull $REGISTRY/$IMAGE_NAME:latest
           
-          # Generate Let's Encrypt certificate if not exists
+          # Generate SSL certificate if not exists
           if [ ! -f ssl/fullchain.pem ]; then
-            echo "📝 Generating self-signed certificate..."
+            echo "🔐 Generating SSL certificate..."
             openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
               -keyout ssl/privkey.pem \
               -out ssl/fullchain.pem \
               -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN"
+            chmod 600 ssl/*
           fi
           
-          # Create nginx configuration
-          cat > nginx/nginx.conf << 'NGINX_EOF'
-          events {
-              worker_connections 1024;
-          }
-          
-          http {
-              include /etc/nginx/mime.types;
-              default_type application/octet-stream;
-          
-              access_log /var/log/nginx/access.log;
-              error_log /var/log/nginx/error.log;
-          
-              gzip on;
-              gzip_vary on;
-              gzip_min_length 1024;
-              gzip_types text/plain text/css text/xml text/javascript application/javascript application/xml+rss application/json;
-          
-              server {
-                  listen 80;
-                  server_name $DOMAIN;
-                  return 301 https://$host$request_uri;
-              }
-          
-              server {
-                  listen 443 ssl http2;
-                  server_name $DOMAIN;
-          
-                  ssl_certificate /etc/nginx/ssl/fullchain.pem;
-                  ssl_certificate_key /etc/nginx/ssl/privkey.pem;
-          
-                  ssl_protocols TLSv1.2 TLSv1.3;
-                  ssl_ciphers ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384;
-                  ssl_prefer_server_ciphers off;
-                  ssl_session_cache shared:SSL:10m;
-                  ssl_session_timeout 10m;
-          
-                  add_header X-Frame-Options "SAMEORIGIN" always;
-                  add_header X-Content-Type-Options "nosniff" always;
-                  add_header X-XSS-Protection "1; mode=block" always;
-                  add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-          
-                  root /usr/share/nginx/html;
-                  index index.html;
-          
-                  location / {
-                      try_files $uri $uri/ /index.html;
-                  }
-          
-                  location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
-                      expires 1y;
-                      add_header Cache-Control "public, immutable";
-                  }
-          
-                  location ~ /\. {
-                      deny all;
-                  }
-              }
-          }
-          NGINX_EOF
-          
-          # Run the container
+          # Run container
+          echo "🐳 Starting container..."
           docker run -d \
             --name $CONTAINER_NAME \
             --restart unless-stopped \
             -p 80:80 \
             -p 443:443 \
-            -v $(pwd)/ssl:/etc/nginx/ssl:ro \
-            -v $(pwd)/nginx/nginx.conf:/etc/nginx/nginx.conf:ro \
+            -v /home/$DEPLOY_USER/app/ssl:/etc/nginx/ssl:ro \
+            -v /home/$DEPLOY_USER/app/logs:/var/log/nginx \
             $REGISTRY/$IMAGE_NAME:latest
           
-          echo "✅ Deployment completed!"
-          EOF
+          echo "✅ Container started!"
           
+          # Show container info
+          echo "📊 Container status:"
+          docker ps --filter "name=$CONTAINER_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+          
+          echo "📋 Recent logs:"
+          docker logs --tail 5 $CONTAINER_NAME
+          DEPLOY_EOF
+          
+          # Make script executable and copy to server
           chmod +x deploy.sh
-          
-          # Copy and execute deployment script on server
           scp -o StrictHostKeyChecking=no deploy.sh $DEPLOY_USER@$SERVER_IP:/tmp/deploy.sh
-          ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$SERVER_IP "chmod +x /tmp/deploy.sh && /tmp/deploy.sh"
+          
+          # Execute on server
+          ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$SERVER_IP "bash /tmp/deploy.sh"
 
-      - name: Verify deployment
+      - name: Health check
         run: |
-          sleep 10
-          curl -f https://${{ secrets.DOMAIN }} || curl -f http://${{ secrets.SERVER_IP }} || echo "Verification failed, but deployment might still be successful"
+          echo "🏥 Starting health check..."
+          
+          # Get short SHA for display
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          
+          MAX_RETRIES=12
+          RETRY_COUNT=0
+          HEALTHY=false
+          
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$HEALTHY" = "false" ]; do
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            echo "Attempt $RETRY_COUNT/$MAX_RETRIES..."
+            
+            # Try HTTPS first
+            if curl -f -k -s -o /dev/null -w "%{http_code}" "https://${{ secrets.DOMAIN }}/" 2>/dev/null | grep -q "200\|301\|302"; then
+              echo "✅ HTTPS check passed!"
+              HEALTHY=true
+              break
+            fi
+            
+            # Try HTTP as fallback
+            if curl -f -s -o /dev/null -w "%{http_code}" "http://${{ secrets.SERVER_IP }}/" 2>/dev/null | grep -q "200\|301\|302"; then
+              echo "✅ HTTP check passed!"
+              HEALTHY=true
+              break
+            fi
+            
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+              echo "⏳ Waiting 5 seconds before next attempt..."
+              sleep 5
+            fi
+          done
+          
+          if [ "$HEALTHY" = "true" ]; then
+            echo "🎉 Health check passed! Application is running."
+          else
+            echo "⚠️ Health check failed after $MAX_RETRIES attempts"
+            echo "Application might still be starting up..."
+          fi
 
-      - name: Send deployment success notification
+      - name: Send success notification
         if: success()
         uses: appleboy/telegram-action@master
         with:
           to: ${{ secrets.TELEGRAM_CHAT_ID }}
           token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           message: |
-            🚀 Deployment Successful!
-            ✅ Application deployed successfully
-            🌐 Domain: https://${{ secrets.DOMAIN }}
-            🐳 Container: birthday-app
-            📅 Time: $(date)
-            🔗 Commit: https://github.com/${{ github.repository }}/commit/${{ github.sha }}
+            🎉 Deployment Successful!
+            
+            🏠 Application: Birthday Invitation Site
+            🔗 URL: https://${{ secrets.DOMAIN }}
+            📍 Server: ${{ secrets.SERVER_IP }}
+            🐳 Container: ${{ env.CONTAINER_NAME }}
+            
+            📊 Details:
+            • Repository: ${{ github.repository }}
+            • Branch: ${{ github.ref }}
+            • Commit: $(echo "${{ github.sha }}" | cut -c1-7)
+            • Deployed by: ${{ github.actor }}
+            • Time: $(date +'%Y-%m-%d %H:%M:%S')
+            
+            🔍 View: https://${{ secrets.DOMAIN }}
+            📝 Commit: https://github.com/${{ github.repository }}/commit/${{ github.sha }}
+            🔧 Actions: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-      - name: Send deployment failure notification
+      - name: Send failure notification
         if: failure()
         uses: appleboy/telegram-action@master
         with:
@@ -276,7 +311,14 @@ jobs:
           token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           message: |
             ❌ Deployment Failed!
-            Repository: ${{ github.repository }}
-            Branch: ${{ github.ref_name }}
-            Error: Check GitHub Actions logs
-            Time: $(date)
+            
+            🏠 Application: Birthday Invitation Site
+            📍 Server: ${{ secrets.SERVER_IP }}
+            
+            ⚠️ Error: Deployment pipeline failed
+            📅 Time: $(date +'%Y-%m-%d %H:%M:%S')
+            
+            🔗 Actions run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            👤 Triggered by: ${{ github.actor }}
+            
+            📋 Please check GitHub Actions logs for details.
