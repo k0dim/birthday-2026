@@ -224,7 +224,7 @@ jobs:
         run: |
           echo "=== Deploying with production setup script ==="
           
-          # Создаем ваш скрипт setup-production.sh
+          # Создаем исправленный скрипт setup-production.sh
           cat > setup-production.sh << 'SCRIPT_EOF'
           #!/bin/bash
           set -e
@@ -242,8 +242,8 @@ jobs:
               APP_DIR="/home/\$USER/app"
           fi
           
-          mkdir -p \$APP_DIR
-          cd \$APP_DIR
+          mkdir -p "\$APP_DIR"
+          cd "\$APP_DIR"
           echo "Working directory: \$(pwd)"
           
           # 1. Создаем nginx.conf
@@ -293,7 +293,7 @@ jobs:
           mkdir -p ssl
           
           # Проверяем Let's Encrypt
-          if [ -f /etc/letsencrypt/live/$DOMAIN/fullchain.pem ]; then
+          if [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
               echo "✅ Using Let's Encrypt certificates"
               SSL_SOURCE="letsencrypt"
           else
@@ -301,10 +301,10 @@ jobs:
               SSL_SOURCE="selfsigned"
               
               # Генерируем self-signed
-              if [ ! -f ssl/fullchain.pem ]; then
-                  openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-                    -keyout ssl/privkey.pem \
-                    -out ssl/fullchain.pem \
+              if [ ! -f "ssl/fullchain.pem" ]; then
+                  openssl req -x509 -nodes -days 365 -newkey rsa:2048 \\
+                    -keyout ssl/privkey.pem \\
+                    -out ssl/fullchain.pem \\
                     -subj "/C=RU/ST=Moscow/L=Moscow/O=Birthday/CN=$DOMAIN"
                   chmod 600 ssl/*
               fi
@@ -321,32 +321,32 @@ jobs:
           
           # 5. Pull нового образа
           echo "5. Pulling new image..."
-          docker pull ghcr.io/${{ github.repository }}:latest
+          docker pull "ghcr.io/${{ github.repository }}:latest"
           
           # 6. Запускаем новый контейнер
           echo "6. Starting new container..."
           
           if [ "\$SSL_SOURCE" = "letsencrypt" ]; then
               # С Let's Encrypt
-              docker run -d \\
-                --name birthday-app \\
-                --restart unless-stopped \\
-                -p 80:80 \\
-                -p 443:443 \\
-                -v \$APP_DIR/nginx.conf:/etc/nginx/nginx.conf:ro \\
-                -v /etc/letsencrypt/live/$DOMAIN/fullchain.pem:/etc/nginx/ssl/fullchain.pem:ro \\
-                -v /etc/letsencrypt/live/$DOMAIN/privkey.pem:/etc/nginx/ssl/privkey.pem:ro \\
-                ghcr.io/${{ github.repository }}:latest
+              docker run -d \
+                --name birthday-app \
+                --restart unless-stopped \
+                -p 80:80 \
+                -p 443:443 \
+                -v "\$APP_DIR/nginx.conf:/etc/nginx/nginx.conf:ro" \
+                -v "/etc/letsencrypt/live/$DOMAIN/fullchain.pem:/etc/nginx/ssl/fullchain.pem:ro" \
+                -v "/etc/letsencrypt/live/$DOMAIN/privkey.pem:/etc/nginx/ssl/privkey.pem:ro" \
+                "ghcr.io/${{ github.repository }}:latest"
           else
               # С self-signed
-              docker run -d \\
-                --name birthday-app \\
-                --restart unless-stopped \\
-                -p 80:80 \\
-                -p 443:443 \\
-                -v \$APP_DIR/nginx.conf:/etc/nginx/nginx.conf:ro \\
-                -v \$APP_DIR/ssl:/etc/nginx/ssl:ro \\
-                ghcr.io/${{ github.repository }}:latest
+              docker run -d \
+                --name birthday-app \
+                --restart unless-stopped \
+                -p 80:80 \
+                -p 443:443 \
+                -v "\$APP_DIR/nginx.conf:/etc/nginx/nginx.conf:ro" \
+                -v "\$APP_DIR/ssl:/etc/nginx/ssl:ro" \
+                "ghcr.io/${{ github.repository }}:latest"
           fi
           
           # 7. Проверяем
@@ -357,7 +357,7 @@ jobs:
           docker ps --filter "name=birthday-app" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
           
           echo -e "\nTesting HTTPS:"
-          curl -k -s -o /dev/null -w "HTTPS Status: %{http_code}\\n" https://$DOMAIN
+          curl -k -s -o /dev/null -w "HTTPS Status: %{http_code}\n" "https://$DOMAIN"
           
           echo -e "\n✅ Setup completed!"
           echo "🔗 Access: https://$DOMAIN"
@@ -370,10 +370,10 @@ jobs:
           chmod +x setup-production.sh
           
           echo "📤 Copying setup script to server..."
-          scp -o StrictHostKeyChecking=no setup-production.sh $DEPLOY_USER@$SERVER_IP:/tmp/setup-production.sh
+          scp -o StrictHostKeyChecking=no setup-production.sh "$DEPLOY_USER@$SERVER_IP:/tmp/setup-production.sh"
           
           echo "🚀 Executing setup script on server..."
-          ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$SERVER_IP "bash /tmp/setup-production.sh"
+          ssh -o StrictHostKeyChecking=no "$DEPLOY_USER@$SERVER_IP" "bash /tmp/setup-production.sh"
 
       - name: Health check
         run: |
