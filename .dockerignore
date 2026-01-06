@@ -17,7 +17,8 @@ dist-ssr
 .idea
 *.md
 LICENSE
-docker-compose*.yml
-Dockerfile
-nginx.conf
-deploy.sh
+
+# НЕ ИГНОРИРУЙТЕ nginx.conf!
+# nginx.conf
+# Dockerfile
+# docker-compose*.yml
