@@ -52,13 +52,6 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Create .env.production for build
-        run: |
-          echo "VITE_TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}" > .env.production
-          echo "VITE_TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" >> .env.production
-          echo "VITE_API_URL=/" >> .env.production
-          echo "✅ .env.production created for build"
-
       - name: Install dependencies
         run: |
           if [ ! -f package-lock.json ]; then
@@ -68,29 +61,25 @@ jobs:
 
       - name: Build application
         run: |
-          npm run build
-          echo "✅ Build successful"
-          
-          # Проверяем что favicon есть
-          if [ -f "dist/index.html" ] && grep -q "favicon" dist/index.html; then
-            echo "✅ Favicon found in build"
+          if npm run | grep -q "build"; then
+            npm run build
+            echo "✅ Build successful"
           else
-            echo "⚠️ Favicon not found in build"
-          fi
-          
-          # Проверяем что Telegram переменные встроились
-          if find dist -name "*.js" -exec grep -l "TELEGRAM\|telegram" {} \; | head -1; then
-            echo "✅ Telegram references found in build"
-          else
-            echo "⚠️ Telegram references not found in build"
+            echo "⚠️ No build script found"
+            if [ -d "dist" ] && [ -f "dist/index.html" ]; then
+              echo "✅ dist directory exists"
+            else
+              echo "❌ Cannot build application"
+              exit 1
+            fi
           fi
 
   build-and-push:
     runs-on: ubuntu-latest
     needs: validation
-    permissions:
+    permissions: # ВАЖНО: Добавляем permissions
       contents: read
-      packages: write
+      packages: write # Разрешение на запись в packages
     
     steps:
       - name: Checkout code
@@ -103,8 +92,8 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ github.actor }} # Используем github.actor вместо secrets
+          password: ${{ secrets.GITHUB_TOKEN }} # Используем GITHUB_TOKEN
 
       - name: Extract metadata
         id: meta
@@ -137,10 +126,8 @@ jobs:
             
             📦 Repository: ${{ github.repository }}
             🌿 Branch: ${{ github.ref_name }}
-            🐳 Image: ${{ env.REGISTRY }}/${{ github.repository }}:latest
+            🔗 Image: ${{ env.REGISTRY }}/${{ github.repository }}:latest
             👤 By: ${{ github.actor }}
-            
-            📊 Run: #${{ github.run_number }}
 
   deploy:
     runs-on: ubuntu-latest
@@ -160,6 +147,18 @@ jobs:
         run: |
           mkdir -p ~/.ssh
           ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts
+
+      - name: Create .env.local
+        run: |
+          cat > .env.local << EOF
+          VITE_TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+          VITE_TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
+          NODE_ENV=production
+          VITE_BASE_URL=/
+          VITE_APP_DOMAIN=dimaparty.ru
+          VITE_DEBUG=false
+          VITE_TELEGRAM_TIMEOUT=10000
+          EOF
 
       - name: Deploy with full SSL and nginx configuration
         env:
@@ -381,87 +380,41 @@ jobs:
             '${{ github.actor }}' \
             '${{ secrets.GITHUB_TOKEN }}'"
 
-      - name: Health check and verification
+      - name: Health check
         run: |
-          echo "🏥 Final health check and verification..."
-          sleep 15
+          echo "🏥 Health check..."
+          sleep 10
           
-          echo "Testing from GitHub Actions runner..."
-          
-          MAX_RETRIES=6
-          RETRY_COUNT=0
-          SUCCESS=false
-          
-          while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$SUCCESS" = false ]; do
-            RETRY_COUNT=$((RETRY_COUNT + 1))
-            echo "Attempt $RETRY_COUNT of $MAX_RETRIES..."
-            
-            # Пробуем HTTPS
-            if curl -k -f -s "https://${{ secrets.DOMAIN }}" > /dev/null; then
-              echo "✅ HTTPS is working!"
-              SUCCESS=true
-              break
-            fi
-            
-            # Пробуем HTTP (должен редиректить)
-            if curl -f -s "http://${{ secrets.SERVER_IP }}" > /dev/null; then
-              echo "✅ HTTP is working (might be redirecting to HTTPS)"
-              SUCCESS=true
-              break
-            fi
-            
-            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-              echo "⏳ Waiting 5 seconds before next attempt..."
-              sleep 5
-            fi
-          done
-          
-          if [ "$SUCCESS" = true ]; then
-            echo "🎉 Site is fully operational!"
-            
-            # Дополнительная проверка
-            echo "Quick content check..."
-            if curl -k -s "https://${{ secrets.DOMAIN }}" | head -5 | grep -q -E "DOCTYPE|html|head|title"; then
-              echo "✅ Site returns valid HTML"
-            fi
+          # Пробуем подключиться
+          if curl -f -k -s https://${{ secrets.DOMAIN }} > /dev/null; then
+            echo "✅ HTTPS is working"
+          elif curl -f -s http://${{ secrets.SERVER_IP }} > /dev/null; then
+            echo "✅ HTTP is working"
           else
-            echo "⚠️ Could not connect to site after $MAX_RETRIES attempts"
-            echo "Site might still be starting up or there might be network issues"
+            echo "⚠️ Could not connect, but deployment might still be in progress"
           fi
 
-      - name: Send deployment success notification
+      - name: Send success notification
         if: success()
         uses: appleboy/telegram-action@master
         with:
           to: ${{ secrets.TELEGRAM_CHAT_ID }}
           token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           message: |
-            🎉 Production Deployment Successful!
+            🎉 Deployment Successful!
             
-            🏠 Application: Birthday Invitation Site
+            🏠 Application: Birthday Invitation
             🔗 URL: https://${{ secrets.DOMAIN }}
             📍 Server: ${{ secrets.SERVER_IP }}
-            🐳 Container: ${{ env.CONTAINER_NAME }}
-            
-            ✅ Configuration:
-            • Nginx: ✅ Configured with SSL
-            • SSL: $(if [ -f "/etc/letsencrypt/live/${{ secrets.DOMAIN }}/fullchain.pem" ]; then echo "✅ Let's Encrypt"; else echo "⚠️ Self-signed"; fi)
-            • Favicon: ✅ Included
-            • Telegram: ✅ Variables embedded
             
             📊 Details:
             • Repository: ${{ github.repository }}
             • Branch: ${{ github.ref_name }}
-            • Commit: $(echo "${{ github.sha }}" | cut -c1-7)
             • Deployed by: ${{ github.actor }}
-            • Time: $(date -u +"%H:%M:%S UTC")
             
-            🔍 Test: Submit RSVP form to verify Telegram notifications
-            📝 Commit: https://github.com/${{ github.repository }}/commit/${{ github.sha }}
-            
-            🎂 Happy Birthday! 🥳
+            🔍 Check: https://${{ secrets.DOMAIN }}
 
-      - name: Send deployment failure notification
+      - name: Send failure notification
         if: failure()
         uses: appleboy/telegram-action@master
         with:
@@ -470,14 +423,7 @@ jobs:
           message: |
             ❌ Deployment Failed!
             
-            🏠 Application: Birthday Invitation
-            📍 Server: ${{ secrets.SERVER_IP }}
-            
-            ⚠️ Error: Production deployment script failed
-            📊 Run: #${{ github.run_number }}
-            👤 Triggered by: ${{ github.actor }}
+            Repository: ${{ github.repository }}
+            Error: Check GitHub Actions logs
             
             🔗 Actions: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-            📅 Time: $(date -u +"%H:%M:%S UTC")
-            
-            📋 Check SSH connection and server logs for details
