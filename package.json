@@ -1,0 +1,41 @@
+{
+  "name": "birthday-invitation",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "homepage": "https://k0dim.github.io/birthday-invitation",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "predeploy": "npm run build",
+    "deploy": "gh-pages -d dist",
+    "setup-env": "node scripts/setup-local-env.js",
+    "env:check": "node scripts/check-env.js",
+    "env:simple": "node scripts/simple-check.js",
+    "env:create": "cp .env.example .env.local && echo '.env.local создан. Отредактируйте его.'",
+    "start": "npm run env:simple && vite",
+    "test:env": "npm run env:simple",
+    "clean": "rm -rf dist node_modules .vite",
+    "reset": "npm run clean && npm install",
+    "prepare": "npm run env:simple || echo 'Запустите npm run setup-env для настройки переменных'"
+  },
+  "dependencies": {
+    "@radix-ui/react-dropdown-menu": "^2.0.6",
+    "clsx": "^2.0.0",
+    "framer-motion": "^10.16.4",
+    "lucide-react": "^0.309.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "tailwind-merge": "^2.2.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.0.0",
+    "autoprefixer": "^10.4.14",
+    "dotenv": "^17.2.3",
+    "gh-pages": "^5.0.0",
+    "postcss": "^8.4.24",
+    "tailwindcss": "^3.3.2",
+    "vite": "^4.4.0"
+  }
+}
