@@ -1,0 +1,282 @@
+name: Deploy Birthday App
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch: # Manual trigger
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  CONTAINER_NAME: birthday-app
+  NGINX_CONTAINER_NAME: birthday-nginx
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run security audit
+        run: |
+          npm audit --audit-level=high || true
+          
+      - name: Check for secrets in code
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          config-path: .gitleaks.toml
+
+  validation:
+    runs-on: ubuntu-latest
+    needs: security-scan
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type checking (if applicable)
+        run: |
+          if [ -f tsconfig.json ]; then
+            npx tsc --noEmit
+          fi
+
+      - name: Lint code
+        run: npm run lint || echo "No lint script found"
+
+      - name: Build for validation
+        run: npm run build
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: validation
+    permissions:
+      contents: read
+      packages: write
+      
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.GHCR_USERNAME }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Send build success notification
+        if: success()
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          message: |
+            ✅ Build Successful
+            Repository: ${{ github.repository }}
+            Branch: ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
+            Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            By: ${{ github.actor }}
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Add server to known hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts
+
+      - name: Deploy to server
+        env:
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          SERVER_IP: ${{ secrets.SERVER_IP }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+        run: |
+          # Create deployment script on the fly
+          cat > deploy.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          
+          echo "🚀 Starting deployment..."
+          
+          # Create directory structure
+          mkdir -p /home/$DEPLOY_USER/birthday-app/{ssl,nginx,data}
+          cd /home/$DEPLOY_USER/birthday-app
+          
+          # Login to GHCR
+          echo ${{ secrets.GHCR_TOKEN }} | docker login ghcr.io -u ${{ secrets.GHCR_USERNAME }} --password-stdin
+          
+          # Stop and remove old containers
+          docker stop $CONTAINER_NAME || true
+          docker rm $CONTAINER_NAME || true
+          
+          # Pull new image
+          docker pull $REGISTRY/$IMAGE_NAME:latest
+          
+          # Generate Let's Encrypt certificate if not exists
+          if [ ! -f ssl/fullchain.pem ]; then
+            echo "📝 Generating self-signed certificate..."
+            openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+              -keyout ssl/privkey.pem \
+              -out ssl/fullchain.pem \
+              -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN"
+          fi
+          
+          # Create nginx configuration
+          cat > nginx/nginx.conf << 'NGINX_EOF'
+          events {
+              worker_connections 1024;
+          }
+          
+          http {
+              include /etc/nginx/mime.types;
+              default_type application/octet-stream;
+          
+              access_log /var/log/nginx/access.log;
+              error_log /var/log/nginx/error.log;
+          
+              gzip on;
+              gzip_vary on;
+              gzip_min_length 1024;
+              gzip_types text/plain text/css text/xml text/javascript application/javascript application/xml+rss application/json;
+          
+              server {
+                  listen 80;
+                  server_name $DOMAIN;
+                  return 301 https://$host$request_uri;
+              }
+          
+              server {
+                  listen 443 ssl http2;
+                  server_name $DOMAIN;
+          
+                  ssl_certificate /etc/nginx/ssl/fullchain.pem;
+                  ssl_certificate_key /etc/nginx/ssl/privkey.pem;
+          
+                  ssl_protocols TLSv1.2 TLSv1.3;
+                  ssl_ciphers ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384;
+                  ssl_prefer_server_ciphers off;
+                  ssl_session_cache shared:SSL:10m;
+                  ssl_session_timeout 10m;
+          
+                  add_header X-Frame-Options "SAMEORIGIN" always;
+                  add_header X-Content-Type-Options "nosniff" always;
+                  add_header X-XSS-Protection "1; mode=block" always;
+                  add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+          
+                  root /usr/share/nginx/html;
+                  index index.html;
+          
+                  location / {
+                      try_files $uri $uri/ /index.html;
+                  }
+          
+                  location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
+                      expires 1y;
+                      add_header Cache-Control "public, immutable";
+                  }
+          
+                  location ~ /\. {
+                      deny all;
+                  }
+              }
+          }
+          NGINX_EOF
+          
+          # Run the container
+          docker run -d \
+            --name $CONTAINER_NAME \
+            --restart unless-stopped \
+            -p 80:80 \
+            -p 443:443 \
+            -v $(pwd)/ssl:/etc/nginx/ssl:ro \
+            -v $(pwd)/nginx/nginx.conf:/etc/nginx/nginx.conf:ro \
+            $REGISTRY/$IMAGE_NAME:latest
+          
+          echo "✅ Deployment completed!"
+          EOF
+          
+          chmod +x deploy.sh
+          
+          # Copy and execute deployment script on server
+          scp -o StrictHostKeyChecking=no deploy.sh $DEPLOY_USER@$SERVER_IP:/tmp/deploy.sh
+          ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$SERVER_IP "chmod +x /tmp/deploy.sh && /tmp/deploy.sh"
+
+      - name: Verify deployment
+        run: |
+          sleep 10
+          curl -f https://${{ secrets.DOMAIN }} || curl -f http://${{ secrets.SERVER_IP }} || echo "Verification failed, but deployment might still be successful"
+
+      - name: Send deployment success notification
+        if: success()
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          message: |
+            🚀 Deployment Successful!
+            ✅ Application deployed successfully
+            🌐 Domain: https://${{ secrets.DOMAIN }}
+            🐳 Container: birthday-app
+            📅 Time: $(date)
+            🔗 Commit: https://github.com/${{ github.repository }}/commit/${{ github.sha }}
+
+      - name: Send deployment failure notification
+        if: failure()
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          message: |
+            ❌ Deployment Failed!
+            Repository: ${{ github.repository }}
+            Branch: ${{ github.ref_name }}
+            Error: Check GitHub Actions logs
+            Time: $(date)

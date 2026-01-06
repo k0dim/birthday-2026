@@ -1,0 +1,7 @@
+title = "gitleaks config"
+
+[[rules]]
+description = "Generic Secret Pattern"
+id = "generic-secret"
+regex = '''(?i)(secret|key|token|password|passwd|pwd|auth)[=:\s]+["']?[a-zA-Z0-9]{16,}["']?'''
+tags = ["key", "secret", "generic"]
