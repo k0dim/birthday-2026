@@ -17,8 +17,11 @@ dist-ssr
 .idea
 *.md
 LICENSE
+docker-compose*.yml
+deploy.sh
+deploy-remote.sh
 
-# НЕ ИГНОРИРУЙТЕ nginx.conf!
-# nginx.conf
-# Dockerfile
-# docker-compose*.yml
+# Оставляем важные файлы для сборки
+# !nginx.conf
+# !docker-entrypoint.sh
+# !Dockerfile
