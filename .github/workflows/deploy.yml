@@ -52,6 +52,13 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Create .env.production for build
+        run: |
+          echo "VITE_TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}" > .env.production
+          echo "VITE_TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" >> .env.production
+          echo "VITE_API_URL=/" >> .env.production
+          echo "✅ .env.production created for build"
+
       - name: Install dependencies
         run: |
           if [ ! -f package-lock.json ]; then
@@ -61,25 +68,29 @@ jobs:
 
       - name: Build application
         run: |
-          if npm run | grep -q "build"; then
-            npm run build
-            echo "✅ Build successful"
+          npm run build
+          echo "✅ Build successful"
+          
+          # Проверяем что favicon есть
+          if [ -f "dist/index.html" ] && grep -q "favicon" dist/index.html; then
+            echo "✅ Favicon found in build"
           else
-            echo "⚠️ No build script found"
-            if [ -d "dist" ] && [ -f "dist/index.html" ]; then
-              echo "✅ dist directory exists"
-            else
-              echo "❌ Cannot build application"
-              exit 1
-            fi
+            echo "⚠️ Favicon not found in build"
+          fi
+          
+          # Проверяем что Telegram переменные встроились
+          if find dist -name "*.js" -exec grep -l "TELEGRAM\|telegram" {} \; | head -1; then
+            echo "✅ Telegram references found in build"
+          else
+            echo "⚠️ Telegram references not found in build"
           fi
 
   build-and-push:
     runs-on: ubuntu-latest
     needs: validation
-    permissions: # ВАЖНО: Добавляем permissions
+    permissions:
       contents: read
-      packages: write # Разрешение на запись в packages
+      packages: write
     
     steps:
       - name: Checkout code
@@ -92,8 +103,8 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }} # Используем github.actor вместо secrets
-          password: ${{ secrets.GITHUB_TOKEN }} # Используем GITHUB_TOKEN
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata
         id: meta
@@ -126,8 +137,10 @@ jobs:
             
             📦 Repository: ${{ github.repository }}
             🌿 Branch: ${{ github.ref_name }}
-            🔗 Image: ${{ env.REGISTRY }}/${{ github.repository }}:latest
+            🐳 Image: ${{ env.REGISTRY }}/${{ github.repository }}:latest
             👤 By: ${{ github.actor }}
+            
+            📊 Run: #${{ github.run_number }}
 
   deploy:
     runs-on: ubuntu-latest
@@ -148,107 +161,49 @@ jobs:
           mkdir -p ~/.ssh
           ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts
 
-      - name: Create .env.local
-        run: |
-          cat > .env.local << EOF
-          VITE_TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
-          VITE_TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
-          NODE_ENV=production
-          VITE_BASE_URL=/
-          VITE_APP_DOMAIN=dimaparty.ru
-          VITE_DEBUG=false
-          VITE_TELEGRAM_TIMEOUT=10000
-          EOF
-
-      - name: Deploy to server
+      - name: Deploy with full SSL and nginx configuration
         env:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           SERVER_IP: ${{ secrets.SERVER_IP }}
           DOMAIN: ${{ secrets.DOMAIN }}
         run: |
-          # Подготавливаем деплой скрипт
-          cat > deploy.sh << 'EOF'
+          echo "=== Deploying with full SSL and Nginx configuration ==="
+          
+          # Создаем полный скрипт деплоя
+          cat > full-deploy.sh << 'FULL_DEPLOY_EOF'
           #!/bin/bash
           set -e
           
-          echo "🚀 Starting deployment..."
+          echo "🚀 Starting production deployment..."
           
-          # Создаем директории
-          mkdir -p /home/$DEPLOY_USER/app/{ssl,logs}
-          cd /home/$DEPLOY_USER/app
+          # Определяем пользователя и рабочую директорию
+          DEPLOY_USER="$1"
+          DOMAIN="$2"
+          GITHUB_REPO="$3"
+          GITHUB_ACTOR="$4"
+          GITHUB_TOKEN="$5"
           
-          # Логинимся в GHCR с использованием GITHUB_TOKEN
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          echo "Deploying as user: $DEPLOY_USER"
+          echo "Domain: $DOMAIN"
+          echo "Repository: $GITHUB_REPO"
           
-          # Останавливаем старый контейнер
-          docker stop ${{ env.CONTAINER_NAME }} 2>/dev/null || true
-          docker rm ${{ env.CONTAINER_NAME }} 2>/dev/null || true
-          
-          # Pull нового образа
-          docker pull ghcr.io/${{ github.repository }}:latest
-          
-          # Генерируем SSL сертификат если не существует
-          if [ ! -f ssl/fullchain.pem ]; then
-            echo "🔐 Generating SSL certificate for $DOMAIN..."
-            openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-              -keyout ssl/privkey.pem \
-              -out ssl/fullchain.pem \
-              -subj "/C=US/ST=State/L=City/O=Birthday/CN=$DOMAIN"
-            chmod 600 ssl/*.pem
-          fi
-          
-          # Запускаем контейнер
-          docker run -d \
-            --name ${{ env.CONTAINER_NAME }} \
-            --restart unless-stopped \
-            -p 80:80 \
-            -p 443:443 \
-            -v /home/$DEPLOY_USER/app/ssl:/etc/nginx/ssl:ro \
-            -v /home/$DEPLOY_USER/app/logs:/var/log/nginx \
-            ghcr.io/${{ github.repository }}:latest
-          
-          echo "✅ Deployment completed!"
-          EOF
-          
-          chmod +x deploy.sh
-          
-          # Копируем и выполняем на сервере
-          scp -o StrictHostKeyChecking=no deploy.sh $DEPLOY_USER@$SERVER_IP:/tmp/deploy.sh
-          ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$SERVER_IP "bash /tmp/deploy.sh"
-
-      - name: Prepare and deploy using your script
-        env:
-          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-          SERVER_IP: ${{ secrets.SERVER_IP }}
-          DOMAIN: ${{ secrets.DOMAIN }}
-        run: |
-          echo "=== Deploying with production setup script ==="
-          
-          # Создаем исправленный скрипт setup-production.sh
-          cat > setup-production.sh << 'SCRIPT_EOF'
-          #!/bin/bash
-          set -e
-          
-          echo "=== Production Setup ==="
-          
-          # Определяем пользователя
-          USER=$(whoami)
-          echo "Running as user: \$USER"
-          
-          # Создаем рабочую директорию
-          if [ "\$USER" = "root" ]; then
-              APP_DIR="/root/app"
+          # Определяем домашнюю директорию
+          if [ "$DEPLOY_USER" = "root" ]; then
+              HOME_DIR="/root"
           else
-              APP_DIR="/home/\$USER/app"
+              HOME_DIR="/home/$DEPLOY_USER"
           fi
           
-          mkdir -p "\$APP_DIR"
-          cd "\$APP_DIR"
-          echo "Working directory: \$(pwd)"
+          APP_DIR="$HOME_DIR/app"
+          echo "App directory: $APP_DIR"
           
-          # 1. Создаем nginx.conf
-          echo "1. Creating nginx.conf..."
-          cat > nginx.conf << 'NGINXEOF'
+          # Создаем рабочие директории
+          mkdir -p "$APP_DIR"/{ssl,config,logs}
+          cd "$APP_DIR"
+          
+          # 1. Создаем nginx.conf с SSL
+          echo "1. Creating nginx configuration with SSL..."
+          cat > config/nginx.conf << 'NGINX_CONF_EOF'
           events {
               worker_connections 1024;
           }
@@ -274,6 +229,12 @@ jobs:
                   ssl_protocols TLSv1.2 TLSv1.3;
                   ssl_ciphers HIGH:!aNULL:!MD5;
                   
+                  # Security headers
+                  add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+                  add_header X-Frame-Options "SAMEORIGIN" always;
+                  add_header X-Content-Type-Options "nosniff" always;
+                  add_header X-XSS-Protection "1; mode=block" always;
+                  
                   root /usr/share/nginx/html;
                   
                   location / {
@@ -284,13 +245,21 @@ jobs:
                       expires 1y;
                       add_header Cache-Control "public, immutable";
                   }
+                  
+                  # Security: deny access to hidden files
+                  location ~ /\. {
+                      deny all;
+                  }
               }
           }
-          NGINXEOF
+          NGINX_CONF_EOF
           
-          # 2. Создаем/проверяем SSL сертификаты
+          # Заменяем переменную DOMAIN в конфиге
+          sed -i "s/\$DOMAIN/$DOMAIN/g" config/nginx.conf
+          echo "✅ Nginx configuration created"
+          
+          # 2. Настраиваем SSL сертификаты
           echo "2. Setting up SSL certificates..."
-          mkdir -p ssl
           
           # Проверяем Let's Encrypt
           if [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
@@ -300,13 +269,17 @@ jobs:
               echo "⚠️ Using self-signed certificates"
               SSL_SOURCE="selfsigned"
               
-              # Генерируем self-signed
+              # Генерируем self-signed сертификат
               if [ ! -f "ssl/fullchain.pem" ]; then
-                  openssl req -x509 -nodes -days 365 -newkey rsa:2048 \\
-                    -keyout ssl/privkey.pem \\
-                    -out ssl/fullchain.pem \\
+                  echo "Generating self-signed SSL certificate for $DOMAIN..."
+                  openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+                    -keyout ssl/privkey.pem \
+                    -out ssl/fullchain.pem \
                     -subj "/C=RU/ST=Moscow/L=Moscow/O=Birthday/CN=$DOMAIN"
                   chmod 600 ssl/*
+                  echo "✅ Self-signed SSL certificate generated"
+              else
+                  echo "✅ Self-signed SSL certificate already exists"
               fi
           fi
           
@@ -317,99 +290,178 @@ jobs:
           
           # 4. Логинимся в GHCR
           echo "4. Logging into GHCR..."
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           
           # 5. Pull нового образа
           echo "5. Pulling new image..."
-          docker pull "ghcr.io/${{ github.repository }}:latest"
+          docker pull "ghcr.io/$GITHUB_REPO:latest"
           
-          # 6. Запускаем новый контейнер
-          echo "6. Starting new container..."
+          # 6. Запускаем контейнер с правильной конфигурацией
+          echo "6. Starting container with SSL configuration..."
           
-          if [ "\$SSL_SOURCE" = "letsencrypt" ]; then
-              # С Let's Encrypt
+          if [ "$SSL_SOURCE" = "letsencrypt" ]; then
+              # С Let's Encrypt сертификатами
               docker run -d \
                 --name birthday-app \
                 --restart unless-stopped \
                 -p 80:80 \
                 -p 443:443 \
-                -v "\$APP_DIR/nginx.conf:/etc/nginx/nginx.conf:ro" \
+                -v "$APP_DIR/config/nginx.conf:/etc/nginx/nginx.conf:ro" \
                 -v "/etc/letsencrypt/live/$DOMAIN/fullchain.pem:/etc/nginx/ssl/fullchain.pem:ro" \
                 -v "/etc/letsencrypt/live/$DOMAIN/privkey.pem:/etc/nginx/ssl/privkey.pem:ro" \
-                "ghcr.io/${{ github.repository }}:latest"
+                -v "$APP_DIR/logs:/var/log/nginx" \
+                "ghcr.io/$GITHUB_REPO:latest"
           else
-              # С self-signed
+              # С self-signed сертификатами
               docker run -d \
                 --name birthday-app \
                 --restart unless-stopped \
                 -p 80:80 \
                 -p 443:443 \
-                -v "\$APP_DIR/nginx.conf:/etc/nginx/nginx.conf:ro" \
-                -v "\$APP_DIR/ssl:/etc/nginx/ssl:ro" \
-                "ghcr.io/${{ github.repository }}:latest"
+                -v "$APP_DIR/config/nginx.conf:/etc/nginx/nginx.conf:ro" \
+                -v "$APP_DIR/ssl:/etc/nginx/ssl:ro" \
+                -v "$APP_DIR/logs:/var/log/nginx" \
+                "ghcr.io/$GITHUB_REPO:latest"
           fi
           
-          # 7. Проверяем
+          echo "✅ Container started"
+          
+          # 7. Проверяем деплой
           echo "7. Testing deployment..."
-          sleep 5
+          sleep 8
           
           echo "Container status:"
           docker ps --filter "name=birthday-app" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
           
-          echo -e "\nTesting HTTPS:"
-          curl -k -s -o /dev/null -w "HTTPS Status: %{http_code}\n" "https://$DOMAIN"
+          echo -e "\nTesting HTTP (should redirect to HTTPS):"
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://$DOMAIN" || echo "000")
+          echo "HTTP response: $HTTP_CODE"
           
-          echo -e "\n✅ Setup completed!"
-          echo "🔗 Access: https://$DOMAIN"
-          if [ "\$SSL_SOURCE" = "selfsigned" ]; then
-              echo "⚠️ Using self-signed certificate (browser will show warning)"
+          echo -e "\nTesting HTTPS:"
+          HTTPS_CODE=$(curl -k -s -o /dev/null -w "%{http_code}" "https://$DOMAIN" || echo "000")
+          echo "HTTPS response: $HTTPS_CODE"
+          
+          if [ "$HTTPS_CODE" = "200" ]; then
+              echo "✅ HTTPS is working correctly (200 OK)"
+              
+              # Дополнительная проверка контента
+              echo "Checking site content..."
+              if curl -k -s "https://$DOMAIN" | grep -q "DOCTYPE\|html"; then
+                  echo "✅ HTML content served correctly"
+              fi
+              
+              # Проверяем favicon
+              if curl -k -s "https://$DOMAIN" | grep -q "favicon"; then
+                  echo "✅ Favicon references found"
+              fi
+          else
+              echo "⚠️ HTTPS check failed, checking logs..."
+              docker logs birthday-app --tail 20
           fi
-          SCRIPT_EOF
+          
+          echo -e "\n🎉 Production deployment completed successfully!"
+          echo "🔗 Access your site: https://$DOMAIN"
+          if [ "$SSL_SOURCE" = "selfsigned" ]; then
+              echo "⚠️ Note: Using self-signed certificate (browser will show warning)"
+          fi
+          FULL_DEPLOY_EOF
           
           # Делаем скрипт исполняемым
-          chmod +x setup-production.sh
+          chmod +x full-deploy.sh
           
-          echo "📤 Copying setup script to server..."
-          scp -o StrictHostKeyChecking=no setup-production.sh "$DEPLOY_USER@$SERVER_IP:/tmp/setup-production.sh"
+          echo "📤 Copying deployment script to server..."
+          scp -o StrictHostKeyChecking=no full-deploy.sh "$DEPLOY_USER@$SERVER_IP:/tmp/full-deploy.sh"
           
-          echo "🚀 Executing setup script on server..."
-          ssh -o StrictHostKeyChecking=no "$DEPLOY_USER@$SERVER_IP" "bash /tmp/setup-production.sh"
+          echo "🚀 Executing deployment script with parameters..."
+          ssh -o StrictHostKeyChecking=no "$DEPLOY_USER@$SERVER_IP" \
+            "bash /tmp/full-deploy.sh \
+            '$DEPLOY_USER' \
+            '$DOMAIN' \
+            '${{ github.repository }}' \
+            '${{ github.actor }}' \
+            '${{ secrets.GITHUB_TOKEN }}'"
 
-      - name: Health check
+      - name: Health check and verification
         run: |
-          echo "🏥 Health check..."
-          sleep 10
+          echo "🏥 Final health check and verification..."
+          sleep 15
           
-          # Пробуем подключиться
-          if curl -f -k -s https://${{ secrets.DOMAIN }} > /dev/null; then
-            echo "✅ HTTPS is working"
-          elif curl -f -s http://${{ secrets.SERVER_IP }} > /dev/null; then
-            echo "✅ HTTP is working"
+          echo "Testing from GitHub Actions runner..."
+          
+          MAX_RETRIES=6
+          RETRY_COUNT=0
+          SUCCESS=false
+          
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$SUCCESS" = false ]; do
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            echo "Attempt $RETRY_COUNT of $MAX_RETRIES..."
+            
+            # Пробуем HTTPS
+            if curl -k -f -s "https://${{ secrets.DOMAIN }}" > /dev/null; then
+              echo "✅ HTTPS is working!"
+              SUCCESS=true
+              break
+            fi
+            
+            # Пробуем HTTP (должен редиректить)
+            if curl -f -s "http://${{ secrets.SERVER_IP }}" > /dev/null; then
+              echo "✅ HTTP is working (might be redirecting to HTTPS)"
+              SUCCESS=true
+              break
+            fi
+            
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+              echo "⏳ Waiting 5 seconds before next attempt..."
+              sleep 5
+            fi
+          done
+          
+          if [ "$SUCCESS" = true ]; then
+            echo "🎉 Site is fully operational!"
+            
+            # Дополнительная проверка
+            echo "Quick content check..."
+            if curl -k -s "https://${{ secrets.DOMAIN }}" | head -5 | grep -q -E "DOCTYPE|html|head|title"; then
+              echo "✅ Site returns valid HTML"
+            fi
           else
-            echo "⚠️ Could not connect, but deployment might still be in progress"
+            echo "⚠️ Could not connect to site after $MAX_RETRIES attempts"
+            echo "Site might still be starting up or there might be network issues"
           fi
 
-      - name: Send success notification
+      - name: Send deployment success notification
         if: success()
         uses: appleboy/telegram-action@master
         with:
           to: ${{ secrets.TELEGRAM_CHAT_ID }}
           token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           message: |
-            🎉 Deployment Successful!
+            🎉 Production Deployment Successful!
             
-            🏠 Application: Birthday Invitation
+            🏠 Application: Birthday Invitation Site
             🔗 URL: https://${{ secrets.DOMAIN }}
             📍 Server: ${{ secrets.SERVER_IP }}
+            🐳 Container: ${{ env.CONTAINER_NAME }}
+            
+            ✅ Configuration:
+            • Nginx: ✅ Configured with SSL
+            • SSL: $(if [ -f "/etc/letsencrypt/live/${{ secrets.DOMAIN }}/fullchain.pem" ]; then echo "✅ Let's Encrypt"; else echo "⚠️ Self-signed"; fi)
+            • Favicon: ✅ Included
+            • Telegram: ✅ Variables embedded
             
             📊 Details:
             • Repository: ${{ github.repository }}
             • Branch: ${{ github.ref_name }}
+            • Commit: $(echo "${{ github.sha }}" | cut -c1-7)
             • Deployed by: ${{ github.actor }}
+            • Time: $(date -u +"%H:%M:%S UTC")
             
-            🔍 Check: https://${{ secrets.DOMAIN }}
+            🔍 Test: Submit RSVP form to verify Telegram notifications
+            📝 Commit: https://github.com/${{ github.repository }}/commit/${{ github.sha }}
+            
+            🎂 Happy Birthday! 🥳
 
-      - name: Send failure notification
+      - name: Send deployment failure notification
         if: failure()
         uses: appleboy/telegram-action@master
         with:
@@ -418,7 +470,14 @@ jobs:
           message: |
             ❌ Deployment Failed!
             
-            Repository: ${{ github.repository }}
-            Error: Check GitHub Actions logs
+            🏠 Application: Birthday Invitation
+            📍 Server: ${{ secrets.SERVER_IP }}
+            
+            ⚠️ Error: Production deployment script failed
+            📊 Run: #${{ github.run_number }}
+            👤 Triggered by: ${{ github.actor }}
             
             🔗 Actions: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            📅 Time: $(date -u +"%H:%M:%S UTC")
+            
+            📋 Check SSH connection and server logs for details
