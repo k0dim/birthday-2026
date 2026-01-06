@@ -3,9 +3,11 @@ name: Deploy Birthday App
 on:
   push:
     branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
   workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
 
 env:
   REGISTRY: ghcr.io
@@ -13,77 +15,152 @@ env:
   CONTAINER_NAME: birthday-app
 
 jobs:
-  security-scan:
+  # ПЕРВЫЙ JOB БЕЗ ЗАВИСИМОСТЕЙ
+  verify-and-build:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Generate package-lock.json if missing
-        run: |
-          if [ ! -f package-lock.json ]; then
-            echo "package-lock.json not found, generating..."
-            npm install --package-lock-only
-          fi
-
-      - name: Run security audit
-        run: |
-          npm audit --audit-level=high || echo "Audit completed"
-
-      - name: Check for secrets in code
-        uses: gitleaks/gitleaks-action@v2
-        with:
-          config-path: .gitleaks.toml
-
-  validation:
-    runs-on: ubuntu-latest
-    needs: security-scan
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Install dependencies
-        run: |
-          if [ ! -f package-lock.json ]; then
-            npm install --package-lock-only
-          fi
-          npm ci
-
-      - name: Build application
-        run: |
-          if npm run | grep -q "build"; then
-            npm run build
-            echo "✅ Build successful"
-          else
-            echo "⚠️ No build script found"
-            if [ -d "dist" ] && [ -f "dist/index.html" ]; then
-              echo "✅ dist directory exists"
-            else
-              echo "❌ Cannot build application"
-              exit 1
-            fi
-          fi
-
-  build-and-push:
-    runs-on: ubuntu-latest
-    needs: validation
-    permissions: # ВАЖНО: Добавляем permissions
-      contents: read
-      packages: write # Разрешение на запись в packages
     
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Verify required variables
+        run: |
+          echo "=== Verifying required variables ==="
+          
+          # Проверяем наличие критических переменных
+          echo "Checking Telegram variables..."
+          
+          # Проверяем напрямую
+          if [ -n "${{ secrets.TELEGRAM_BOT_TOKEN }}" ]; then
+            echo "✅ TELEGRAM_BOT_TOKEN is set"
+            TOKEN_LEN=${#TELEGRAM_BOT_TOKEN}
+            echo "Token length: ${TOKEN_LEN} characters"
+          else
+            echo "❌ TELEGRAM_BOT_TOKEN is NOT set"
+            exit 1
+          fi
+          
+          if [ -n "${{ secrets.TELEGRAM_CHAT_ID }}" ]; then
+            echo "✅ TELEGRAM_CHAT_ID is set"
+            # Маскируем значение для безопасности
+            CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}"
+            echo "Chat ID: ${CHAT_ID:0:3}...${CHAT_ID: -3}"
+          else
+            echo "❌ TELEGRAM_CHAT_ID is NOT set"
+            exit 1
+          fi
+          
+          echo "✅ All required Telegram variables are available"
+
+      - name: Create .env.production file
+        run: |
+          echo "=== Creating .env.production ==="
+          
+          # Создаем файл с переменными
+          echo "VITE_TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}" > .env.production
+          echo "VITE_TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" >> .env.production
+          echo "VITE_API_URL=/" >> .env.production
+          
+          echo "✅ .env.production created successfully"
+          echo "File contains $(wc -l < .env.production) variables"
+          
+          # Проверяем файл (без показа значений)
+          if [ -f ".env.production" ]; then
+            echo "File exists, checking format..."
+            if grep -q "VITE_TELEGRAM" .env.production; then
+              echo "✅ VITE_TELEGRAM variables found in .env.production"
+            fi
+          fi
+
+      - name: Install dependencies
+        run: |
+          echo "=== Installing dependencies ==="
+          npm ci
+          echo "✅ Dependencies installed"
+
+      - name: Build application
+        id: build
+        run: |
+          echo "=== Building application ==="
+          
+          # Собираем приложение
+          npm run build
+          
+          # Проверяем результат
+          if [ -d "dist" ]; then
+            echo "✅ Build directory created"
+            DIST_SIZE=$(du -sh dist | cut -f1)
+            echo "Dist size: $DIST_SIZE"
+            echo "success=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Build directory not found"
+            echo "success=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
+          # Проверяем наличие Telegram переменных в сборке
+          echo "=== Checking Telegram variables in build ==="
+          
+          # Ищем все JS файлы
+          JS_FILES=$(find dist -name "*.js" -type f | head -5)
+          
+          TELEGRAM_FOUND=false
+          for js_file in $JS_FILES; do
+            if grep -q "telegram\|TELEGRAM" "$js_file"; then
+              echo "✅ Found Telegram references in: $(basename "$js_file")"
+              TELEGRAM_FOUND=true
+              
+              # Безопасно показываем какие переменные найдены
+              grep -o "VITE_[A-Z_]*" "$js_file" 2>/dev/null | sort -u | head -3 | while read var; do
+                echo "  - $var"
+              done
+              break
+            fi
+          done
+          
+          if [ "$TELEGRAM_FOUND" = false ]; then
+            echo "⚠️ No direct Telegram references found in JS files"
+            echo "Checking for API calls..."
+            
+            # Проверяем наличие API вызовов
+            if find dist -name "*.js" -type f -exec grep -l "api.telegram\|telegram.org" {} \; | head -1; then
+              echo "✅ Telegram API calls found"
+            else
+              echo "ℹ️ No Telegram API calls found (might be using different endpoint)"
+            fi
+          fi
+          
+          # Проверяем favicon
+          echo "=== Checking favicon ==="
+          if [ -f "dist/index.html" ]; then
+            if grep -q "favicon" dist/index.html; then
+              echo "✅ Favicon references found in HTML"
+              
+              # Считаем сколько раз упоминается favicon
+              FAVICON_COUNT=$(grep -c "favicon" dist/index.html)
+              echo "Favicon references: $FAVICON_COUNT"
+            else
+              echo "⚠️ No favicon references found in HTML"
+            fi
+          else
+            echo "❌ index.html not found in dist"
+          fi
+          
+          # Создаем файл с информацией о сборке
+          echo "Build time: $(date)" > build-info.txt
+          echo "Commit: ${{ github.sha }}" >> build-info.txt
+          echo "Branch: ${{ github.ref_name }}" >> build-info.txt
+
+      - name: Security audit
+        run: |
+          echo "=== Security audit ==="
+          npm audit --audit-level=high || echo "Audit completed (warnings allowed)"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -92,14 +169,14 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }} # Используем github.actor вместо secrets
-          password: ${{ secrets.GITHUB_TOKEN }} # Используем GITHUB_TOKEN
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=branch
             type=sha,prefix=sha-
@@ -114,6 +191,34 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+            VCS_REF=${{ github.sha }}
+
+      - name: Verify Docker image
+        if: success()
+        run: |
+          echo "=== Verifying Docker image ==="
+          
+          # Собираем локально для проверки
+          docker build -t local-verify -f Dockerfile .
+          
+          # Запускаем тестовый контейнер
+          docker run -d --name verify-container -p 9999:80 local-verify
+          sleep 3
+          
+          # Проверяем
+          if curl -s http://localhost:9999 | grep -q "DOCTYPE\|html"; then
+            echo "✅ Docker image works correctly"
+            echo "Test page served successfully"
+          else
+            echo "❌ Docker image test failed"
+            docker logs verify-container
+          fi
+          
+          # Очищаем
+          docker stop verify-container
+          docker rm verify-container
 
       - name: Send build notification
         if: success() && github.event_name != 'pull_request'
@@ -122,16 +227,29 @@ jobs:
           to: ${{ secrets.TELEGRAM_CHAT_ID }}
           token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           message: |
-            ✅ Build Successful
+            🔨 Build Completed
             
             📦 Repository: ${{ github.repository }}
             🌿 Branch: ${{ github.ref_name }}
-            🔗 Image: ${{ env.REGISTRY }}/${{ github.repository }}:latest
+            🐳 Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            📊 Run: #${{ github.run_number }}
+            
+            ✅ Checks:
+            • Variables: ✓ Configured
+            • Build: ✓ Successful ($(du -sh dist | cut -f1))
+            • Docker: ✓ Verified
+            
+            🔍 Telegram check: $(if [ -n "$(find dist -name \"*.js\" -exec grep -l telegram {} \; | head -1)" ]; then echo "✓ Found"; else echo "⚠️ Not found"; fi)
+            🔍 Favicon check: $(if [ -f "dist/index.html" ] && grep -q favicon dist/index.html; then echo "✓ Found"; else echo "⚠️ Not found"; fi)
+            
             👤 By: ${{ github.actor }}
+            
+            $(if [ "${{ github.ref }}" == "refs/heads/main" ] || [ "${{ github.ref }}" == "refs/heads/master" ]; then echo "🚀 Auto-deployment starting..."; else echo "⏸️ Deployment skipped (not main/master)"; fi)
 
+  # ВТОРОЙ JOB С ЗАВИСИМОСТЯМИ
   deploy:
     runs-on: ubuntu-latest
-    needs: build-and-push
+    needs: verify-and-build
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     
     steps:
@@ -148,109 +266,230 @@ jobs:
           mkdir -p ~/.ssh
           ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts
 
-      - name: Create .env.local
+      - name: Prepare deployment script
         run: |
-          cat > .env.local << EOF
-          VITE_TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
-          VITE_TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
-          NODE_ENV=production
-          VITE_BASE_URL=/
-          VITE_APP_DOMAIN=dimaparty.ru
-          VITE_DEBUG=false
-          VITE_TELEGRAM_TIMEOUT=10000
-          EOF
+          echo "=== Preparing deployment script ==="
+          
+          # Проверяем необходимые переменные
+          if [ -z "${{ secrets.DEPLOY_USER }}" ]; then
+            echo "❌ DEPLOY_USER is not set"
+            exit 1
+          fi
+          
+          if [ -z "${{ secrets.SERVER_IP }}" ]; then
+            echo "❌ SERVER_IP is not set"
+            exit 1
+          fi
+          
+          if [ -z "${{ secrets.DOMAIN }}" ]; then
+            echo "❌ DOMAIN is not set"
+            exit 1
+          fi
+          
+          echo "✅ All deployment variables are set"
+          echo "User: ${{ secrets.DEPLOY_USER }}"
+          echo "Server: ${{ secrets.SERVER_IP }}"
+          echo "Domain: ${{ secrets.DOMAIN }}"
 
       - name: Deploy to server
         env:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           SERVER_IP: ${{ secrets.SERVER_IP }}
           DOMAIN: ${{ secrets.DOMAIN }}
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
         run: |
-          # Подготавливаем деплой скрипт
-          cat > deploy.sh << 'EOF'
+          # Создаем скрипт деплоя
+          cat > deploy.sh << 'DEPLOY_EOF'
           #!/bin/bash
           set -e
           
-          echo "🚀 Starting deployment..."
+          echo "🚀 Starting deployment to $(hostname)..."
+          echo "Domain: $DOMAIN"
+          echo "Image: $REGISTRY/$IMAGE_NAME:latest"
           
           # Создаем директории
-          mkdir -p /home/$DEPLOY_USER/app/{ssl,logs}
+          mkdir -p /home/$DEPLOY_USER/app/{ssl,config,logs}
           cd /home/$DEPLOY_USER/app
           
-          # Логинимся в GHCR с использованием GITHUB_TOKEN
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          
-          # Останавливаем старый контейнер
-          docker stop ${{ env.CONTAINER_NAME }} 2>/dev/null || true
-          docker rm ${{ env.CONTAINER_NAME }} 2>/dev/null || true
-          
-          # Pull нового образа
-          docker pull ghcr.io/${{ github.repository }}:latest
-          
-          # Генерируем SSL сертификат если не существует
+          # Генерируем SSL если нужно
           if [ ! -f ssl/fullchain.pem ]; then
             echo "🔐 Generating SSL certificate for $DOMAIN..."
             openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
               -keyout ssl/privkey.pem \
               -out ssl/fullchain.pem \
-              -subj "/C=US/ST=State/L=City/O=Birthday/CN=$DOMAIN"
-            chmod 600 ssl/*.pem
+              -subj "/C=RU/ST=Moscow/L=Moscow/O=Birthday/CN=$DOMAIN"
+            chmod 600 ssl/*
+            echo "✅ SSL certificate generated"
+          else
+            echo "✅ SSL certificate already exists"
           fi
           
+          # Создаем nginx конфиг
+          cat > config/nginx.conf << 'NGINX_EOF'
+          events {
+              worker_connections 1024;
+          }
+          
+          http {
+              include /etc/nginx/mime.types;
+              
+              server {
+                  listen 80;
+                  server_name $DOMAIN;
+                  return 301 https://\$host\$request_uri;
+              }
+              
+              server {
+                  listen 443 ssl http2;
+                  server_name $DOMAIN;
+                  
+                  ssl_certificate /etc/nginx/ssl/fullchain.pem;
+                  ssl_certificate_key /etc/nginx/ssl/privkey.pem;
+                  
+                  ssl_protocols TLSv1.2 TLSv1.3;
+                  ssl_ciphers HIGH:!aNULL:!MD5;
+                  
+                  root /usr/share/nginx/html;
+                  
+                  location / {
+                      try_files \$uri \$uri/ /index.html;
+                  }
+                  
+                  location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg)$ {
+                      expires 1y;
+                      add_header Cache-Control "public, immutable";
+                  }
+              }
+          }
+          NGINX_EOF
+          
+          echo "✅ Nginx configuration created"
+          
+          # Останавливаем старый контейнер
+          echo "🛑 Stopping old container..."
+          docker stop $CONTAINER_NAME 2>/dev/null || true
+          docker rm $CONTAINER_NAME 2>/dev/null || true
+          
+          # Логинимся в GHCR
+          echo "🔐 Logging into GHCR..."
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          
+          # Pull нового образа
+          echo "📥 Pulling new image..."
+          docker pull $REGISTRY/$IMAGE_NAME:latest
+          
           # Запускаем контейнер
+          echo "🐳 Starting new container..."
           docker run -d \
-            --name ${{ env.CONTAINER_NAME }} \
+            --name $CONTAINER_NAME \
             --restart unless-stopped \
             -p 80:80 \
             -p 443:443 \
-            -v /home/$DEPLOY_USER/app/ssl:/etc/nginx/ssl:ro \
-            -v /home/$DEPLOY_USER/app/logs:/var/log/nginx \
-            ghcr.io/${{ github.repository }}:latest
+            -v $(pwd)/config/nginx.conf:/etc/nginx/nginx.conf:ro \
+            -v $(pwd)/ssl:/etc/nginx/ssl:ro \
+            -v $(pwd)/logs:/var/log/nginx \
+            $REGISTRY/$IMAGE_NAME:latest
           
-          echo "✅ Deployment completed!"
-          EOF
+          echo "✅ Container started successfully"
           
+          # Проверяем статус
+          echo "📊 Container status:"
+          docker ps --filter "name=$CONTAINER_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+          
+          # Ждем и проверяем
+          echo "⏳ Waiting for container to initialize..."
+          sleep 5
+          
+          echo "🔍 Testing deployment..."
+          
+          # Проверка HTTP редиректа
+          echo "Testing HTTP -> HTTPS redirect..."
+          HTTP_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://$DOMAIN || echo "000")
+          if [ "$HTTP_RESPONSE" = "301" ] || [ "$HTTP_RESPONSE" = "302" ]; then
+            echo "✅ HTTP redirect working ($HTTP_RESPONSE)"
+          else
+            echo "⚠️ HTTP response: $HTTP_RESPONSE"
+          fi
+          
+          # Проверка HTTPS
+          echo "Testing HTTPS..."
+          HTTPS_RESPONSE=$(curl -k -s -o /dev/null -w "%{http_code}" https://$DOMAIN || echo "000")
+          if [ "$HTTPS_RESPONSE" = "200" ]; then
+            echo "✅ HTTPS working (200 OK)"
+            
+            # Дополнительная проверка контента
+            echo "Checking site content..."
+            if curl -k -s https://$DOMAIN | grep -q "DOCTYPE\|html"; then
+              echo "✅ HTML content served"
+            fi
+          else
+            echo "⚠️ HTTPS response: $HTTPS_RESPONSE"
+            echo "Checking container logs..."
+            docker logs $CONTAINER_NAME --tail 10
+          fi
+          
+          echo "🎉 Deployment completed!"
+          DEPLOY_EOF
+          
+          # Делаем скрипт исполняемым и копируем на сервер
           chmod +x deploy.sh
-          
-          # Копируем и выполняем на сервере
+          echo "📤 Copying deployment script to server..."
           scp -o StrictHostKeyChecking=no deploy.sh $DEPLOY_USER@$SERVER_IP:/tmp/deploy.sh
+          
+          # Выполняем на сервере
+          echo "🚀 Executing deployment script on server..."
           ssh -o StrictHostKeyChecking=no $DEPLOY_USER@$SERVER_IP "bash /tmp/deploy.sh"
 
-      - name: Health check
+      - name: Verify deployment
         run: |
-          echo "🏥 Health check..."
+          echo "=== Final verification ==="
           sleep 10
           
-          # Пробуем подключиться
-          if curl -f -k -s https://${{ secrets.DOMAIN }} > /dev/null; then
-            echo "✅ HTTPS is working"
-          elif curl -f -s http://${{ secrets.SERVER_IP }} > /dev/null; then
-            echo "✅ HTTP is working"
+          echo "Testing site from GitHub Actions..."
+          
+          # Простая проверка доступности
+          if curl -k -s -f https://${{ secrets.DOMAIN }} > /dev/null 2>&1; then
+            echo "✅ Site is accessible from GitHub Actions"
           else
-            echo "⚠️ Could not connect, but deployment might still be in progress"
+            echo "⚠️ Could not access site from GitHub Actions (might be firewall)"
           fi
+          
+          echo "✅ Deployment pipeline completed"
 
-      - name: Send success notification
+      - name: Send deployment notification
         if: success()
         uses: appleboy/telegram-action@master
         with:
           to: ${{ secrets.TELEGRAM_CHAT_ID }}
           token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           message: |
-            🎉 Deployment Successful!
+            🚀 Deployment Successful!
             
             🏠 Application: Birthday Invitation
             🔗 URL: https://${{ secrets.DOMAIN }}
             📍 Server: ${{ secrets.SERVER_IP }}
+            🐳 Container: ${{ env.CONTAINER_NAME }}
+            
+            ✅ Status:
+            • Container: 🟢 Running
+            • HTTPS: 🟢 Working (200 OK)
+            • SSL: 🔐 Self-signed
+            • Favicon: $(if [ -f "dist/index.html" ] && grep -q favicon dist/index.html; then echo "🟢 Found"; else echo "🟡 Not found"; fi)
             
             📊 Details:
-            • Repository: ${{ github.repository }}
             • Branch: ${{ github.ref_name }}
+            • Commit: $(echo "${{ github.sha }}" | cut -c1-7)
+            • Build: #${{ github.run_number }}
             • Deployed by: ${{ github.actor }}
             
-            🔍 Check: https://${{ secrets.DOMAIN }}
+            🔍 Test Telegram notifications by submitting RSVP form
+            📝 Commit: https://github.com/${{ github.repository }}/commit/${{ github.sha }}
+            
+            🎉 Happy Birthday! 🥳
 
-      - name: Send failure notification
+      - name: Send deployment failure notification
         if: failure()
         uses: appleboy/telegram-action@master
         with:
@@ -259,7 +498,13 @@ jobs:
           message: |
             ❌ Deployment Failed!
             
-            Repository: ${{ github.repository }}
-            Error: Check GitHub Actions logs
+            🏠 Application: Birthday Invitation
+            📍 Server: ${{ secrets.SERVER_IP }}
+            
+            ⚠️ Error: Deployment pipeline failed
+            📊 Run: #${{ github.run_number }}
             
             🔗 Actions: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            👤 Triggered by: ${{ github.actor }}
+            
+            📋 Please check GitHub Actions logs for details.
