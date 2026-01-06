@@ -148,6 +148,18 @@ jobs:
           mkdir -p ~/.ssh
           ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts
 
+      - name: Create .env.local
+        run: |
+          cat > .env.local << EOF
+          VITE_TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+          VITE_TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
+          NODE_ENV=production
+          VITE_BASE_URL=/
+          VITE_APP_DOMAIN=dimaparty.ru
+          VITE_DEBUG=false
+          VITE_TELEGRAM_TIMEOUT=10000
+          EOF
+
       - name: Deploy to server
         env:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
